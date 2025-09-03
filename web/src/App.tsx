@@ -42,7 +42,7 @@ function preprocessImage(ctx: CanvasRenderingContext2D, width: number, height: n
     processed[i + 2] = b
     processed[i + 3] = a
   }
-
+  
   return processed
 }
 
@@ -747,6 +747,107 @@ function labelComponentsBinary(
   return components
 }
 
+// Build gray-plate mask from original image (HSV/Lab gates) and return channels for scoring
+function buildGrayPlateMaskChannels(
+  data: Uint8ClampedArray,
+  w: number,
+  h: number
+): { mask: Uint8Array; S: Uint8Array; L: Uint8Array } {
+  const S_MAX = 40, L_MIN = 150, L_MAX = 235, AB_MAX = 12
+  const mask = new Uint8Array(w * h)
+  const S = new Uint8Array(w * h)
+  const L = new Uint8Array(w * h)
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4
+      const r = data[i], g = data[i + 1], b = data[i + 2]
+      const { s } = rgbToHsv(r, g, b)
+      const lab = rgbToLab(r, g, b)
+      S[y * w + x] = s
+      L[y * w + x] = lab.L
+      const lowS = s <= S_MAX
+      const mL = lab.L >= L_MIN && lab.L <= L_MAX
+      const aOk = Math.abs(lab.a - 128) <= AB_MAX
+      const bOk = Math.abs(lab.b - 128) <= AB_MAX
+      mask[y * w + x] = lowS && mL && aOk && bOk ? 1 : 0
+    }
+  }
+  let m: any = mask
+  m = morphCloseDisk(m, w, h, 3) as unknown as Uint8Array
+  m = dilateBinaryDisk(m, w, h, 2) as unknown as Uint8Array
+  return { mask: m, S, L }
+}
+
+function polygonCentroid(poly: [number, number][]): { x: number; y: number } {
+  let signedArea = 0
+  let cx = 0, cy = 0
+  for (let i = 0; i < poly.length; i++) {
+    const [x0, y0] = poly[i]
+    const [x1, y1] = poly[(i + 1) % poly.length]
+    const a = x0 * y1 - x1 * y0
+    signedArea += a
+    cx += (x0 + x1) * a
+    cy += (y0 + y1) * a
+  }
+  signedArea *= 0.5
+  if (Math.abs(signedArea) < 1e-5) {
+    // fallback simple average
+    let sx = 0, sy = 0
+    for (const [x, y] of poly) { sx += x; sy += y }
+    const n = Math.max(1, poly.length)
+    return { x: sx / n, y: sy / n }
+  }
+  cx = cx / (6 * signedArea)
+  cy = cy / (6 * signedArea)
+  return { x: cx, y: cy }
+}
+
+// Create ring mask around polygon using local ROI and binary dilations
+function makeRingMaskForPolygon(
+  poly: [number, number][],
+  ring: number,
+  thickness: number,
+  sheetW: number,
+  sheetH: number
+): { x0: number; y0: number; w: number; h: number; mask: Uint8Array } {
+  let minX = sheetW, minY = sheetH, maxX = 0, maxY = 0
+  for (const [x, y] of poly) { if (x < minX) minX = x; if (y < minY) minY = y; if (x > maxX) maxX = x; if (y > maxY) maxY = y }
+  const margin = Math.ceil(ring + thickness + 6)
+  const x0 = Math.max(0, Math.floor(minX) - margin)
+  const y0 = Math.max(0, Math.floor(minY) - margin)
+  const x1 = Math.min(sheetW, Math.ceil(maxX) + margin)
+  const y1 = Math.min(sheetH, Math.ceil(maxY) + margin)
+  const w = Math.max(1, x1 - x0)
+  const h = Math.max(1, y1 - y0)
+  const seed = new Uint8Array(w * h)
+  // rasterize polygon to local ROI via OffscreenCanvas
+  const off = new OffscreenCanvas(w, h)
+  const octx = off.getContext('2d')!
+  octx.clearRect(0, 0, w, h)
+  octx.beginPath()
+  poly.forEach(([px, py], i) => {
+    const lx = px - x0
+    const ly = py - y0
+    if (i === 0) octx.moveTo(lx, ly)
+    else octx.lineTo(lx, ly)
+  })
+  octx.closePath()
+  octx.fillStyle = '#fff'
+  octx.fill()
+  const img = octx.getImageData(0, 0, w, h).data
+  for (let yy = 0; yy < h; yy++) {
+    for (let xx = 0; xx < w; xx++) {
+      const ii = (yy * w + xx) * 4
+      seed[yy * w + xx] = img[ii] > 0 ? 1 : 0
+    }
+  }
+  const inner = dilateBinaryDisk(seed, w, h, Math.max(0, Math.floor(ring)))
+  const outer = dilateBinaryDisk(seed, w, h, Math.max(0, Math.floor(ring + thickness)))
+  const ringMask = new Uint8Array(w * h)
+  for (let i = 0; i < ringMask.length; i++) ringMask[i] = outer[i] === 1 && inner[i] === 0 ? 1 : 0
+  return { x0, y0, w, h, mask: ringMask }
+}
+
 // Detect polygons using the silhouette pipeline and add uniform padding
 async function detectPolygonsSilhouette(
   canvas: HTMLCanvasElement,
@@ -1253,31 +1354,71 @@ function App() {
     canvas.width = img.naturalWidth
     canvas.height = img.naturalHeight
     ctx.drawImage(img, 0, 0)
+    const sheet = ctx.getImageData(0, 0, canvas.width, canvas.height)
+    const grayChannels = buildGrayPlateMaskChannels(sheet.data, canvas.width, canvas.height)
+    const RINGS = [24, 40, 64, 96, 128]
+    const THICK = 18
     const updated: typeof crops = []
     for (const c of crops) {
       if (!c.polygon) { updated.push(c); continue }
-      const ringPx = 40
-      const bb = c.bounds
-      const rx = Math.max(0, bb.x - ringPx)
-      const ry = Math.max(0, bb.y - ringPx)
-      const rw = Math.min(canvas.width - rx, bb.w + ringPx * 2)
-      const rh = Math.min(canvas.height - ry, bb.h + ringPx * 2)
-      if (Math.hypot(rw - bb.w, rh - bb.h) > 100) {
-        updated.push({ ...c, needsReview: true })
-        continue
+      let best: { x: number; y: number; w: number; h: number } | null = null
+      let bestScore = -1
+      const cent = polygonCentroid(c.polygon)
+      for (const r of RINGS) {
+        const ring = makeRingMaskForPolygon(c.polygon, r, THICK, canvas.width, canvas.height)
+        // intersect with GRAY mask
+        const comps: Array<{ x: number; y: number; w: number; h: number; area: number; meanS: number; meanL: number; solidity: number }>=[]
+        // simple connected components in local ROI using intersection
+        const inter = new Uint8Array(ring.w * ring.h)
+        for (let yy = 0; yy < ring.h; yy++) {
+          for (let xx = 0; xx < ring.w; xx++) {
+            const gi = (ring.y0 + yy) * canvas.width + (ring.x0 + xx)
+            inter[yy * ring.w + xx] = ring.mask[yy * ring.w + xx] & grayChannels.mask[gi]
+          }
+        }
+        const localComps = labelComponentsBinary(inter, ring.w, ring.h)
+        for (const cc of localComps) {
+          const bx = ring.x0 + cc.bounds.x, by = ring.y0 + cc.bounds.y
+          const bw = cc.bounds.w, bh = cc.bounds.h
+          const areaPct = (bw * bh) / (canvas.width * canvas.height)
+          const ar = bw / Math.max(1, bh)
+          if (!(areaPct >= 0.0002 && areaPct <= 0.008)) continue
+          if (!(ar >= 1.5 && ar <= 6.5)) continue
+          // solidity proxy via boundary/perimeter
+          const boundary = boundaryFromMask((() => { const m = new Uint8Array(bw * bh); for (const [px, py] of cc.pixels) { const lx = px - cc.bounds.x; const ly = py - cc.bounds.y; m[ly * bw + lx] = 1 } return m })(), bw, bh)
+          let per = 0; for (let i = 0; i < boundary.length; i++) if (boundary[i]) per++
+          const solidity = Math.min(1, cc.area / Math.max(1, per))
+          if (solidity < 0.85) continue
+          // mean S and L in bbox
+          let sumS = 0, sumL = 0
+          for (let yy = 0; yy < bh; yy++) {
+            for (let xx = 0; xx < bw; xx++) {
+              const gi = (by + yy) * canvas.width + (bx + xx)
+              sumS += grayChannels.S[gi]
+              sumL += grayChannels.L[gi]
+            }
+          }
+          const meanS = sumS / (bw * bh)
+          const meanL = sumL / (bw * bh)
+          const d = Math.hypot(bx + bw / 2 - cent.x, by + bh / 2 - cent.y)
+          const score = 2000 / (d + 1) + (255 - meanS) + 0.4 * meanL
+          if (score > bestScore) { bestScore = score; best = { x: bx, y: by, w: bw, h: bh } }
+        }
       }
-      const roi = document.createElement('canvas')
-      roi.width = rw
-      roi.height = rh
-      const rctx = roi.getContext('2d')!
-      rctx.fillStyle = 'white'
-      rctx.fillRect(0, 0, rw, rh)
-      rctx.drawImage(canvas, rx, ry, rw, rh, 0, 0, rw, rh)
-      const { text, conf } = await recognizeTextFromRoi(roi)
-      if (text && conf >= 70) {
-        updated.push({ ...c, detectedText: text, name: text, ocrConf: conf, needsReview: false })
+      if (best) {
+        const pad = 8
+        const rx = Math.max(0, best.x - pad)
+        const ry = Math.max(0, best.y - pad)
+        const rw = Math.min(canvas.width - rx, best.w + pad * 2)
+        const rh = Math.min(canvas.height - ry, best.h + pad * 2)
+        const roi = document.createElement('canvas')
+        roi.width = rw; roi.height = rh
+        roi.getContext('2d')!.drawImage(canvas, rx, ry, rw, rh, 0, 0, rw, rh)
+        const { text, conf } = await recognizeTextFromRoi(roi)
+        if (text && conf >= 70) updated.push({ ...c, detectedText: text, name: text, ocrConf: conf, needsReview: false })
+        else updated.push({ ...c, detectedText: text ?? undefined, ocrConf: conf, needsReview: true })
       } else {
-        updated.push({ ...c, detectedText: text ?? undefined, ocrConf: conf, needsReview: true })
+        updated.push({ ...c, needsReview: true })
       }
     }
     setCrops(updated)
@@ -2007,6 +2148,78 @@ function App() {
                     className="px-2 py-1 bg-blue-600 hover:bg-blue-500 rounded text-xs"
                   >
                     ↓
+                  </button>
+                  <button
+                    onClick={async () => {
+                      // retry with wider ring radii
+                      if (!canvasRef.current || !imgRef.current || !crop.polygon) return
+                      const canvas = canvasRef.current
+                      const ctx = canvas.getContext('2d', { willReadFrequently: true })!
+                      canvas.width = imgRef.current.naturalWidth
+                      canvas.height = imgRef.current.naturalHeight
+                      ctx.drawImage(imgRef.current, 0, 0)
+                      const sheet = ctx.getImageData(0, 0, canvas.width, canvas.height)
+                      const grayChannels = buildGrayPlateMaskChannels(sheet.data, canvas.width, canvas.height)
+                      const RINGS = [64, 96, 140, 180]
+                      const THICK = 18
+                      let best: { x: number; y: number; w: number; h: number } | null = null
+                      let bestScore = -1
+                      const cent = polygonCentroid(crop.polygon)
+                      for (const r of RINGS) {
+                        const ring = makeRingMaskForPolygon(crop.polygon, r, THICK, canvas.width, canvas.height)
+                        const inter = new Uint8Array(ring.w * ring.h)
+                        for (let yy = 0; yy < ring.h; yy++) {
+                          for (let xx = 0; xx < ring.w; xx++) {
+                            const gi = (ring.y0 + yy) * canvas.width + (ring.x0 + xx)
+                            inter[yy * ring.w + xx] = ring.mask[yy * ring.w + xx] & grayChannels.mask[gi]
+                          }
+                        }
+                        const localComps = labelComponentsBinary(inter, ring.w, ring.h)
+                        for (const cc of localComps) {
+                          const bx = ring.x0 + cc.bounds.x, by = ring.y0 + cc.bounds.y
+                          const bw = cc.bounds.w, bh = cc.bounds.h
+                          const areaPct = (bw * bh) / (canvas.width * canvas.height)
+                          const ar = bw / Math.max(1, bh)
+                          if (!(areaPct >= 0.0002 && areaPct <= 0.008)) continue
+                          if (!(ar >= 1.5 && ar <= 6.5)) continue
+                          const boundary = boundaryFromMask((() => { const m = new Uint8Array(bw * bh); for (const [px, py] of cc.pixels) { const lx = px - cc.bounds.x; const ly = py - cc.bounds.y; m[ly * bw + lx] = 1 } return m })(), bw, bh)
+                          let per = 0; for (let i = 0; i < boundary.length; i++) if (boundary[i]) per++
+                          const solidity = Math.min(1, cc.area / Math.max(1, per))
+                          if (solidity < 0.85) continue
+                          let sumS = 0, sumL = 0
+                          for (let yy = 0; yy < bh; yy++) {
+                            for (let xx = 0; xx < bw; xx++) {
+                              const gi = (by + yy) * canvas.width + (bx + xx)
+                              sumS += grayChannels.S[gi]
+                              sumL += grayChannels.L[gi]
+                            }
+                          }
+                          const meanS = sumS / (bw * bh)
+                          const meanL = sumL / (bw * bh)
+                          const d = Math.hypot(bx + bw / 2 - cent.x, by + bh / 2 - cent.y)
+                          const score = 2000 / (d + 1) + (255 - meanS) + 0.4 * meanL
+                          if (score > bestScore) { bestScore = score; best = { x: bx, y: by, w: bw, h: bh } }
+                        }
+                      }
+                      if (best) {
+                        const pad = 10
+                        const rx = Math.max(0, best.x - pad)
+                        const ry = Math.max(0, best.y - pad)
+                        const rw = Math.min(canvas.width - rx, best.w + pad * 2)
+                        const rh = Math.min(canvas.height - ry, best.h + pad * 2)
+                        const roi = document.createElement('canvas')
+                        roi.width = rw; roi.height = rh
+                        roi.getContext('2d')!.drawImage(canvas, rx, ry, rw, rh, 0, 0, rw, rh)
+                        const { text, conf } = await recognizeTextFromRoi(roi)
+                        if (text && conf >= 70) setCrops(crops.map(c => c.id === crop.id ? { ...c, detectedText: text, name: text, ocrConf: conf, needsReview: false } : c))
+                        else setCrops(crops.map(c => c.id === crop.id ? { ...c, detectedText: text ?? undefined, ocrConf: conf, needsReview: true } : c))
+                      } else {
+                        setCrops(crops.map(c => c.id === crop.id ? { ...c, needsReview: true } : c))
+                      }
+                    }}
+                    className="px-2 py-1 bg-purple-700 hover:bg-purple-600 rounded text-xs"
+                  >
+                    Retry
                   </button>
                 </div>
               </div>
