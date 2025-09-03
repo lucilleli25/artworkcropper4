@@ -864,6 +864,9 @@ function assignPlatesToCrops(
   return map
 }
 
+// eslint-disable-next-line no-unused-vars, @typescript-eslint/no-unused-vars
+/* istanbul ignore next */
+// @ts-ignore unused retained for future polygon ops
 function polygonCentroid(poly: [number, number][]): { x: number; y: number } {
   let signedArea = 0
   let cx = 0, cy = 0
@@ -889,6 +892,9 @@ function polygonCentroid(poly: [number, number][]): { x: number; y: number } {
 }
 
 // Create ring mask around polygon using local ROI and binary dilations
+// eslint-disable-next-line no-unused-vars, @typescript-eslint/no-unused-vars
+/* istanbul ignore next */
+// @ts-ignore unused retained for potential local searches
 function makeRingMaskForPolygon(
   poly: [number, number][],
   ring: number,
@@ -942,8 +948,24 @@ async function detectPolygonsSilhouette(
 ): Promise<{ polygons: Array<{ id: string; polygon: [number, number][]; bounds: { x: number; y: number; w: number; h: number } }>; mask: { data: Uint8Array; width: number; height: number } }> {
   const { width, height } = canvas
   const rgba = ctx.getImageData(0, 0, width, height).data
-  // In line-art mode, suppress gray labels from the silhouette
-  const mask = buildSilhouetteMask(rgba, width, height, params, false)
+  // compute color-based gray plate first
+  const { mask: grayPlateMask2 } = buildGrayPlateMaskChannels(rgba, width, height)
+  // build ink-only RGBA by suppressing gray pixels
+  const inkOnly = new Uint8ClampedArray(rgba.length)
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const gi = y * width + x
+      const i = gi * 4
+      if (grayPlateMask2[gi] === 1) {
+        // treat as white paper → eliminates plates before silhouette
+        inkOnly[i] = 255; inkOnly[i+1] = 255; inkOnly[i+2] = 255; inkOnly[i+3] = 255
+      } else {
+        inkOnly[i] = rgba[i]; inkOnly[i+1] = rgba[i+1]; inkOnly[i+2] = rgba[i+2]; inkOnly[i+3] = rgba[i+3]
+      }
+    }
+  }
+  // silhouette uses ink-only data now
+  const mask = buildSilhouetteMask(inkOnly, width, height, params, false)
   let comps = labelComponentsBinary(mask, width, height)
 
   // --- NEW: robust gray-plate suppression (color-based occupancy) ---
@@ -1416,6 +1438,7 @@ function App() {
   const [crops, setCrops] = useState<Array<{id: string, blob: Blob, name: string, bounds: {x: number, y: number, w: number, h: number}, polygon?: [number, number][], detectedText?: string, ocrConf?: number, needsReview?: boolean}>>([])
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameInput, setRenameInput] = useState<string>('')
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   
   // ---------- OCR Worker Queue (non-blocking) ----------
   const ocrWorkerRef = useRef<Worker | null>(null)
@@ -1556,10 +1579,10 @@ function App() {
       setOcrTotal(jobs.length)
       setOcrInProgress(true)
       ensureOcrWorker()
-      setCrops(updated)                    // reflect “will name” state in UI
+      setCrops(updated)                    // reflect "will name" state in UI
       for (const j of jobs) enqueueOCR(j)  // worker pipeline handles updating names
     } else {
-      setCrops(updated)
+    setCrops(updated)
     }
   }
   const [isProcessing, setIsProcessing] = useState(false)
@@ -1685,6 +1708,21 @@ function App() {
 
   const applyPreset = (presetKey: string) => {
     setSelectedPreset(presetKey)
+    if (presetKey === 'custom') return
+    const key = `params:${presetKey}`
+    const raw = localStorage.getItem(key)
+    if (raw) {
+      try {
+        setParams(JSON.parse(raw))
+      } catch {
+        // fall back to preset defaults if parsing fails
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        setParams((presets as any)[presetKey].params)
+      }
+    } else {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      setParams((presets as any)[presetKey].params)
+    }
   }
 
   // persist per-preset values
@@ -1777,8 +1815,23 @@ function App() {
         }
 
         // Fallback: grid-based detection (legacy)
+        // Suppress gray number plates globally for this path
         const newCrops: Array<{id: string, blob: Blob, name: string, bounds: {x: number, y: number, w: number, h: number}}> = []
-        const processedImageData = preprocessImage(ctx, canvas.width, canvas.height, params)
+        const sheet = ctx.getImageData(0, 0, canvas.width, canvas.height)
+        const { mask: grayMask } = buildGrayPlateMaskChannels(sheet.data, canvas.width, canvas.height)
+        // Build processed image, then whiten gray-plate pixels so they can't trigger detection
+        let processedImageData = preprocessImage(ctx, canvas.width, canvas.height, params)
+        for (let y = 0; y < canvas.height; y++) {
+          for (let x = 0; x < canvas.width; x++) {
+            const gi = y * canvas.width + x
+            if (grayMask[gi] === 1) {
+              const i = gi * 4
+              processedImageData[i] = 255
+              processedImageData[i + 1] = 255
+              processedImageData[i + 2] = 255
+            }
+          }
+        }
         const baseGridSize = params.gridSize
         const gridSize = baseGridSize + params.padding * 2
         const cols = Math.floor(canvas.width / gridSize)
@@ -1793,6 +1846,26 @@ function App() {
             const w = Math.min(canvas.width - x, gridSize - params.padding * 2 + (col > 0 ? overlap : 0) + (col < cols - 1 ? overlap : 0))
             const h = Math.min(canvas.height - y, gridSize - params.padding * 2 + (row > 0 ? overlap : 0) + (row < rows - 1 ? overlap : 0))
             if (x + w < canvas.width && y + h < canvas.height) {
+              // Skip ROIs dominated by gray plates (fast occupancy gate)
+              let grayCount = 0
+              for (let yy = y; yy < y + h; yy++) {
+                const base = yy * canvas.width
+                for (let xx = x; xx < x + w; xx++) {
+                  if (grayMask[base + xx] === 1) grayCount++
+                }
+              }
+              const grayOcc = grayCount / Math.max(1, w * h)
+              if (grayOcc > 0.35) { // dominated by label area → ignore
+                processedCount++
+                if (processedCount === totalCells) {
+                  const merged = mergeOverlapping(newCrops)
+                  recropWithPolygons(canvas, ctx, processedImageData, merged, params).then((polygonCrops) => {
+                    setCrops(polygonCrops)
+                  })
+                  setIsProcessing(false)
+                }
+                continue
+              }
               const hasContent = detectContent(processedImageData, x, y, w, h, canvas.width, params)
               if (hasContent) {
                 const cropCanvas = document.createElement('canvas')
@@ -1889,6 +1962,113 @@ function App() {
     setTimeout(() => { a.click(); URL.revokeObjectURL(url) }, crops.length * 120)
   }
 
+  function bboxIntersectionArea(a: {x:number;y:number;w:number;h:number}, b: {x:number;y:number;w:number;h:number}) {
+    const ax2 = a.x + a.w, ay2 = a.y + a.h, bx2 = b.x + b.w, by2 = b.y + b.h
+    const ix = Math.max(0, Math.min(ax2, bx2) - Math.max(a.x, b.x))
+    const iy = Math.max(0, Math.min(ay2, by2) - Math.max(a.y, b.y))
+    return ix * iy
+  }
+
+  function bboxDistance(a: {x:number;y:number;w:number;h:number}, b: {x:number;y:number;w:number;h:number}) {
+    const ax = a.x + a.w/2, ay = a.y + a.h/2
+    const bx = b.x + b.w/2, by = b.y + b.h/2
+    return Math.hypot(ax - bx, ay - by)
+  }
+
+  const mergeSelectedCrops = async () => {
+    if (selectedIds.size !== 2 || !canvasRef.current) return
+    const [id1, id2] = Array.from(selectedIds)
+    const c1 = crops.find(c => c.id === id1)
+    const c2 = crops.find(c => c.id === id2)
+    if (!c1 || !c2) return
+    const a = c1.bounds, b = c2.bounds
+    const inter = bboxIntersectionArea(a, b)
+    const unionArea = a.w * a.h + b.w * b.h - inter
+    const iou = unionArea > 0 ? inter / unionArea : 0
+    const near = bboxDistance(a, b) <= Math.max(Math.max(a.w, a.h), Math.max(b.w, b.h)) * 0.75
+    if (iou <= 0 && !near) {
+      alert('Selected items do not overlap or are not close enough to merge.')
+      return
+    }
+    // Union bbox
+    const ux = Math.min(a.x, b.x)
+    const uy = Math.min(a.y, b.y)
+    const ux2 = Math.max(a.x + a.w, b.x + b.w)
+    const uy2 = Math.max(a.y + a.h, b.y + b.h)
+    const uw = ux2 - ux
+    const uh = uy2 - uy
+
+    // Build a union mask from polygons (fallback to rectangles)
+    const maskCanvas = new OffscreenCanvas(uw, uh)
+    const mctx = maskCanvas.getContext('2d')!
+    mctx.clearRect(0, 0, uw, uh)
+    mctx.fillStyle = '#fff'
+    const drawPoly = (poly?: [number, number][], rect?: {x:number;y:number;w:number;h:number}) => {
+      mctx.beginPath()
+      if (poly && poly.length >= 3) {
+        poly.forEach(([px, py], i) => {
+          const lx = px - ux
+          const ly = py - uy
+          if (i === 0) mctx.moveTo(lx, ly)
+          else mctx.lineTo(lx, ly)
+        })
+        mctx.closePath()
+      } else if (rect) {
+        mctx.rect(rect.x - ux, rect.y - uy, rect.w, rect.h)
+      }
+      mctx.fill()
+    }
+    drawPoly(c1.polygon, c1.bounds)
+    drawPoly(c2.polygon, c2.bounds)
+
+    // Read mask and derive a single external contour for the union
+    const idata = mctx.getImageData(0, 0, uw, uh).data
+    let bin: any = new Uint8Array(uw * uh) as any
+    for (let y = 0; y < uh; y++) {
+      for (let x = 0; x < uw; x++) {
+        const i = (y * uw + x) * 4
+        bin[y * uw + x] = idata[i + 3] > 0 || idata[i] > 0 ? 1 : 0
+      }
+    }
+    // Slight close to bridge any tiny gap between items
+    bin = morphCloseDisk(bin, uw, uh, 2) as unknown as Uint8Array
+    const boundary = boundaryFromMask(bin, uw, uh)
+    const polyLocal = traceExternalContour(boundary, uw, uh)
+    if (polyLocal.length < 3) return
+    const simplified = simplifyPath(polyLocal, Math.max(2, Math.floor(0.008 * (uw + uh))))
+    const polyGlobal = simplified.map(([px, py]) => [px + ux, py + uy] as [number, number])
+
+    // Create the merged cropped image using the union polygon
+    const canvas = canvasRef.current
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!
+    const img = imgRef.current
+    if (!img) return
+    canvas.width = img.naturalWidth
+    canvas.height = img.naturalHeight
+    ctx.drawImage(img, 0, 0)
+
+    const off = new OffscreenCanvas(uw, uh)
+    const offCtx = off.getContext('2d')!
+    offCtx.drawImage(canvas, ux, uy, uw, uh, 0, 0, uw, uh)
+    offCtx.globalCompositeOperation = 'destination-in'
+    offCtx.beginPath()
+    simplified.forEach(([px, py], idx) => {
+      if (idx === 0) offCtx.moveTo(px, py)
+      else offCtx.lineTo(px, py)
+    })
+    offCtx.closePath()
+    offCtx.fill()
+    offCtx.globalCompositeOperation = 'source-over'
+    const blob = await off.convertToBlob({ type: 'image/png' })
+    const mergedItem = { id: `merge-${Date.now()}`, blob, name: c1.name, bounds: { x: ux, y: uy, w: uw, h: uh }, polygon: polyGlobal }
+
+    setCrops(prev => {
+      const filtered = prev.filter(c => c.id !== id1 && c.id !== id2)
+      return [...filtered, mergedItem]
+    })
+    setSelectedIds(new Set())
+  }
+
   return (
     <div className="h-screen w-full flex flex-col bg-neutral-950 text-white">
       {/* Header */}
@@ -1921,6 +2101,16 @@ function App() {
             className="px-3 py-1 rounded bg-blue-700 hover:bg-blue-500"
           >
             Download All ({crops.length})
+          </button>
+        )}
+        {crops.length > 0 && (
+          <button
+            onClick={mergeSelectedCrops}
+            disabled={selectedIds.size !== 2}
+            className={`px-3 py-1 rounded ${selectedIds.size===2 ? 'bg-amber-700 hover:bg-amber-600' : 'bg-neutral-700 opacity-50'} `}
+            title="Merge two selected items (overlapping or nearby)"
+          >
+            Merge Selected (2)
           </button>
         )}
         {crops.length > 0 && (
@@ -2288,6 +2478,24 @@ function App() {
           <div className="grid grid-cols-3 gap-2 max-h-full overflow-auto">
             {crops.map((crop) => (
               <div key={crop.id} className="bg-neutral-800 rounded p-2">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="flex items-center gap-1 text-[11px] text-neutral-300">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(crop.id)}
+                      onChange={(e) => {
+                        setSelectedIds(prev => {
+                          const next = new Set(prev)
+                          if (e.target.checked) next.add(crop.id)
+                          else next.delete(crop.id)
+                          return next
+                        })
+                      }}
+                    />
+                    Select
+                  </label>
+                  <span className="text-[11px] text-neutral-400">{crop.id}</span>
+                </div>
                 <img
                   src={URL.createObjectURL(crop.blob)}
                   alt={crop.name}
@@ -2331,6 +2539,13 @@ function App() {
                     ↓
                   </button>
                   <button
+                    onClick={() => setCrops(prev => prev.filter(c => c.id !== crop.id))}
+                    className="px-2 py-1 bg-red-700 hover:bg-red-600 rounded text-xs"
+                    title="Delete this item"
+                  >
+                    Delete
+                  </button>
+                  <button
                     onClick={async () => {
                       if (!canvasRef.current || !imgRef.current || !crop.polygon) return
                       const canvas = canvasRef.current
@@ -2338,55 +2553,33 @@ function App() {
                       canvas.width = imgRef.current.naturalWidth
                       canvas.height = imgRef.current.naturalHeight
                       ctx.drawImage(imgRef.current, 0, 0)
-                      const sheet = ctx.getImageData(0, 0, canvas.width, canvas.height)
-                      const grayChannels = buildGrayPlateMaskChannels(sheet.data, canvas.width, canvas.height)
-                      const RINGS = [64, 96, 140, 180]
-                      const THICK = 18
-                      let best: { x: number; y: number; w: number; h: number } | null = null
-                      let bestScore = -1
-                      const cent = polygonCentroid(crop.polygon)
-                      for (const r of RINGS) {
-                        const ring = makeRingMaskForPolygon(crop.polygon, r, THICK, canvas.width, canvas.height)
-                        const inter = new Uint8Array(ring.w * ring.h)
-                        for (let yy = 0; yy < ring.h; yy++) {
-                          for (let xx = 0; xx < ring.w; xx++) {
-                            const gi = (ring.y0 + yy) * canvas.width + (ring.x0 + xx)
-                            inter[yy * ring.w + xx] = ring.mask[yy * ring.w + xx] & grayChannels.mask[gi]
-                          }
-                        }
-                        const localComps = labelComponentsBinary(inter, ring.w, ring.h)
-                        for (const cc of localComps) {
-                          const bx = ring.x0 + cc.bounds.x, by = ring.y0 + cc.bounds.y
-                          const bw = cc.bounds.w, bh = cc.bounds.h
-                          const areaPct = (bw * bh) / (canvas.width * canvas.height)
-                          const ar = bw / Math.max(1, bh)
-                          if (!(areaPct >= 0.0002 && areaPct <= 0.008)) continue
-                          if (!(ar >= 1.5 && ar <= 6.5)) continue
-                          const boundary = boundaryFromMask((() => { const m = new Uint8Array(bw * bh); for (const [px, py] of cc.pixels) { const lx = px - cc.bounds.x; const ly = py - cc.bounds.y; m[ly * bw + lx] = 1 } return m })(), bw, bh)
-                          let per = 0; for (let i = 0; i < boundary.length; i++) if (boundary[i]) per++
-                          const solidity = Math.min(1, cc.area / Math.max(1, per))
-                          if (solidity < 0.85) continue
-                          let sumS = 0, sumL = 0
-                          for (let yy = 0; yy < bh; yy++) {
-                            for (let xx = 0; xx < bw; xx++) {
-                              const gi = (by + yy) * canvas.width + (bx + xx)
-                              sumS += grayChannels.S[gi]
-                              sumL += grayChannels.L[gi]
-                            }
-                          }
-                          const meanS = sumS / (bw * bh)
-                          const meanL = sumL / (bw * bh)
-                          const d = Math.hypot(bx + bw / 2 - cent.x, by + bh / 2 - cent.y)
-                          const score = 2000 / (d + 1) + (255 - meanS) + 0.4 * meanL
-                          if (score > bestScore) { bestScore = score; best = { x: bx, y: by, w: bw, h: bh } }
-                        }
-                      }
-                      if (best) {
-                        const pad = 10
-                        const rx = Math.max(0, best.x - pad)
-                        const ry = Math.max(0, best.y - pad)
-                        const rw = Math.min(canvas.width - rx, best.w + pad * 2)
-                        const rh = Math.min(canvas.height - ry, best.h + pad * 2)
+
+                      // Downscale once and detect all plates quickly
+                      const maskScale = Math.min(1, MAX_MASK_SIDE / Math.max(canvas.width, canvas.height))
+                      const maskW = Math.max(1, Math.round(canvas.width * maskScale))
+                      const maskH = Math.max(1, Math.round(canvas.height * maskScale))
+                      const mCanvas = new OffscreenCanvas(maskW, maskH)
+                      const mCtx = mCanvas.getContext('2d')!
+                      mCtx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, maskW, maskH)
+                      const maskImage = mCtx.getImageData(0, 0, maskW, maskH)
+                      const platesSmall = detectGrayPlatesGlobal(maskImage.data, maskW, maskH)
+                      const inv = 1 / (maskScale || 1)
+                      const plates: BBox[] = platesSmall.map(b => ({
+                        x: Math.floor(b.x * inv),
+                        y: Math.floor(b.y * inv),
+                        w: Math.ceil(b.w * inv),
+                        h: Math.ceil(b.h * inv),
+                      }))
+
+                      // Assign nearest plate only for this crop
+                      const assigned = assignPlatesToCrops(plates, [{ id: crop.id, bounds: crop.bounds, polygon: crop.polygon }])
+                      const p = assigned[crop.id]
+                      if (p) {
+                        const pad = 8
+                        const rx = Math.max(0, p.x - pad)
+                        const ry = Math.max(0, p.y - pad)
+                        const rw = Math.min(canvas.width - rx, p.w + pad * 2)
+                        const rh = Math.min(canvas.height - ry, p.h + pad * 2)
                         const bitmap = await createBitmapForOCR(canvas, rx, ry, rw, rh)
                         ocrCanceledRef.current = false
                         setOcrDone(0); setOcrTotal(1); setOcrInProgress(true)
