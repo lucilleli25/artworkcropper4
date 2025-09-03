@@ -429,6 +429,7 @@ function rgbToLab(r: number, g: number, b: number): { L: number; a: number; b: n
 }
 
 // K-means over features [L,a,b,S,V] on a downsampled grid
+/* removed: kmeans (unused after dual-gate gray suppression)
 function kmeans(features: number[][], K: number, iters = 8): { centers: number[][]; labels: number[] } {
   const N = features.length
   const D = features[0].length
@@ -469,8 +470,10 @@ function kmeans(features: number[][], K: number, iters = 8): { centers: number[]
   }
   return { centers, labels }
 }
+*/
 
 // Compute adaptive gray center using downsampled k-means on LAB/HSV
+/* removed: adaptive gray center (unused after dual-gate gray suppression)
 export function computeAdaptiveGrayCenter(
   data: Uint8ClampedArray,
   w: number,
@@ -508,6 +511,7 @@ export function computeAdaptiveGrayCenter(
   const [Lc, ac, bc, Sc, Vc] = centers[best]
   return { center: { L: Lc, a: ac, b: bc, S: Sc, V: Vc }, frac }
 }
+*/
 
 // Simple Sobel edge magnitude → binary mask (0/1)
 function sobelEdgesBinary(
@@ -610,68 +614,26 @@ function buildSilhouetteMask(
   w: number,
   h: number,
   params: EdgeParams,
-  useGraySuppress = false
+  _useGraySuppress = false
 ): Uint8Array {
+  // A) Strict dark-ink silhouette (intensity-only)
   const gray = new Uint8Array(w * h)
-  const hsvS = useGraySuppress ? new Uint8Array(w * h) : null
-  const labL = useGraySuppress ? new Uint8Array(w * h) : null
-  const labA = useGraySuppress ? new Uint8Array(w * h) : null
-  const labB = useGraySuppress ? new Uint8Array(w * h) : null
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4
-      const r = data[i]
-      const g = data[i + 1]
-      const b = data[i + 2]
+      const r = data[i], g = data[i + 1], b = data[i + 2]
       gray[y * w + x] = Math.round((r + g + b) / 3)
-      if (useGraySuppress && hsvS && labL && labA && labB) {
-        const { s } = rgbToHsv(r, g, b)
-        const lab = rgbToLab(r, g, b)
-        hsvS[y * w + x] = s
-        labL[y * w + x] = lab.L
-        labA[y * w + x] = lab.a
-        labB[y * w + x] = lab.b
-      }
     }
   }
   const otsu = otsuThreshold(gray)
-  let bin: any = new Uint8Array(w * h)
-  if (useGraySuppress) {
-    const DARK_BIAS = 12
-    const tDark = Math.max(0, Math.min(255, otsu - DARK_BIAS))
-    for (let i = 0; i < gray.length; i++) bin[i] = gray[i] < tDark ? 1 : 0
-    // HSV + Lab gray detection
-    const S_MAX = 35, Lmin = 150, Lmax = 230, A_MAX = 10, B_MAX = 10
-    let text: any = new Uint8Array(w * h)
-    for (let i = 0; i < gray.length; i++) {
-      const lowSat = (hsvS![i] <= S_MAX) ? 1 : 0
-      const midL = (labL![i] >= Lmin && labL![i] <= Lmax) ? 1 : 0
-      const aOk = Math.abs(labA![i] - 128) <= A_MAX ? 1 : 0
-      const bOk = Math.abs(labB![i] - 128) <= B_MAX ? 1 : 0
-      text[i] = lowSat & midL & aOk & bOk
-    }
-    text = morphCloseDisk(text as Uint8Array, w, h, 1) as unknown as Uint8Array
-    text = dilateBinaryDisk(text as Uint8Array, w, h, 1) as unknown as Uint8Array
-    const notText = new Uint8Array(w * h)
-    for (let i = 0; i < text.length; i++) notText[i] = text[i] ? 0 : 1
-    const combined = new Uint8Array(w * h)
-    for (let i = 0; i < bin.length; i++) combined[i] = bin[i] & notText[i]
-    bin = combined
-  } else {
-    for (let i = 0; i < gray.length; i++) bin[i] = gray[i] < otsu ? 1 : 0
-  }
+  const T_DARK = Math.min(255, otsu + 12)
+  let ink: any = new Uint8Array(w * h)
+  for (let i = 0; i < gray.length; i++) ink[i] = gray[i] >= T_DARK ? 0 : 1
+  // bridge tiny gaps (elliptical proxy via 3x3 close + 1x dilate)
+  ink = morphCloseDisk(ink, w, h, 1) as unknown as Uint8Array
+  ink = dilateBinaryDisk(ink, w, h, 1) as unknown as Uint8Array
 
-  // morphological close (dilate then erode) to connect broken strokes
-  const closeIters = Math.max(0, params.morphClose || 0)
-  for (let k = 0; k < closeIters; k++) {
-    bin = dilateBinary(bin, w, h, 1) as unknown as Uint8Array
-    bin = erodeBinary(bin, w, h, 1) as unknown as Uint8Array
-  }
-  // additional dilation to merge nearby strokes
-  const dilIters = Math.max(0, params.morphDilate || 0)
-  for (let k = 0; k < dilIters; k++) bin = dilateBinary(bin, w, h, 2) as unknown as Uint8Array
-
-  return bin
+  return ink
 }
 
 // Find all external contours from a binary mask
@@ -794,8 +756,43 @@ async function detectPolygonsSilhouette(
   const { width, height } = canvas
   const rgba = ctx.getImageData(0, 0, width, height).data
   // In line-art mode, suppress gray labels from the silhouette
-  const mask = buildSilhouetteMask(rgba, width, height, params, true)
-  const comps = labelComponentsBinary(mask, width, height)
+  const mask = buildSilhouetteMask(rgba, width, height, params, false)
+  let comps = labelComponentsBinary(mask, width, height)
+
+  // B) Cheap post-filter to drop gray plates using strict T_DARK
+  const gray = new Uint8Array(width * height)
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4
+      const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2]
+      gray[y * width + x] = Math.round((r + g + b) / 3)
+    }
+  }
+  const otsu = otsuThreshold(gray)
+  const T_DARK = Math.min(255, otsu + 12)
+  const filtered: typeof comps = []
+  for (const c of comps) {
+    const r = c.bounds
+    let darkCount = 0
+    for (let yy = r.y; yy < r.y + r.h; yy++) {
+      for (let xx = r.x; xx < r.x + r.w; xx++) {
+        const gi = yy * width + xx
+        if (gray[gi] < T_DARK) darkCount++
+      }
+    }
+    const inkRatio = darkCount / (r.w * r.h)
+    // mean brightness
+    let sum = 0
+    for (let yy = r.y; yy < r.y + r.h; yy++) {
+      for (let xx = r.x; xx < r.x + r.w; xx++) {
+        sum += gray[yy * width + xx]
+      }
+    }
+    const meanL = sum / (r.w * r.h)
+    const pass = !(inkRatio < 0.10 && meanL > 170)
+    if (pass) filtered.push(c)
+  }
+  comps = filtered
 
   const totalPx = width * height
   // scale-normalized area (defaults ~0.12% of processed image)
