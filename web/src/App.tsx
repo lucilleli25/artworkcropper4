@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import './index.css'
 import { LabelWithHelp } from './components/ui/LabelWithHelp'
+import Tesseract from 'tesseract.js'
 
 // Image preprocessing function
 function preprocessImage(ctx: CanvasRenderingContext2D, width: number, height: number, params: EdgeParams): Uint8ClampedArray {
@@ -41,7 +42,7 @@ function preprocessImage(ctx: CanvasRenderingContext2D, width: number, height: n
     processed[i + 2] = b
     processed[i + 3] = a
   }
-  
+
   return processed
 }
 
@@ -1218,7 +1219,72 @@ function SliderRow({ id, label, short, help, min, max, step, value, disabled, on
 
 function App() {
   const [image, setImage] = useState<string | null>(null)
-  const [crops, setCrops] = useState<Array<{id: string, blob: Blob, name: string, bounds: {x: number, y: number, w: number, h: number}, polygon?: [number, number][]}>>([])
+  const [crops, setCrops] = useState<Array<{id: string, blob: Blob, name: string, bounds: {x: number, y: number, w: number, h: number}, polygon?: [number, number][], detectedText?: string, ocrConf?: number, needsReview?: boolean}>>([])
+  const [renamingId, setRenamingId] = useState<string | null>(null)
+  const [renameInput, setRenameInput] = useState<string>('')
+  
+  async function recognizeTextFromRoi(roiCanvas: HTMLCanvasElement): Promise<{ text: string | null; conf: number }> {
+    const scale = 2
+    const off = document.createElement('canvas')
+    off.width = roiCanvas.width * scale
+    off.height = roiCanvas.height * scale
+    const octx = off.getContext('2d')!
+    octx.fillStyle = 'white'
+    octx.fillRect(0, 0, off.width, off.height)
+    octx.imageSmoothingEnabled = false
+    octx.drawImage(roiCanvas, 0, 0, off.width, off.height)
+    const res7 = await Tesseract.recognize(off, 'eng', { logger: () => {} })
+    let raw = (res7.data.text || '').trim()
+    let conf = res7.data.confidence || 0
+    if (!raw) {
+      const res6 = await Tesseract.recognize(off, 'eng', { logger: () => {} })
+      raw = (res6.data.text || '').trim()
+      conf = Math.max(conf, res6.data.confidence || 0)
+    }
+    // whitelist post-filter
+    raw = raw.replace(/[^0-9-]/g, '')
+    const ok = /^([0-9]{3,})(-[0-9]{2})?$/.test(raw)
+    return { text: ok ? raw : null, conf }
+  }
+
+  async function detectAndNameAll() {
+    if (!canvasRef.current || crops.length === 0) return
+    const canvas = canvasRef.current
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!
+    const img = imgRef.current
+    if (!img) return
+    canvas.width = img.naturalWidth
+    canvas.height = img.naturalHeight
+    ctx.drawImage(img, 0, 0)
+    const updated: typeof crops = []
+    for (const c of crops) {
+      if (!c.polygon) { updated.push(c); continue }
+      const ringPx = 40
+      const bb = c.bounds
+      const rx = Math.max(0, bb.x - ringPx)
+      const ry = Math.max(0, bb.y - ringPx)
+      const rw = Math.min(canvas.width - rx, bb.w + ringPx * 2)
+      const rh = Math.min(canvas.height - ry, bb.h + ringPx * 2)
+      if (Math.hypot(rw - bb.w, rh - bb.h) > 100) {
+        updated.push({ ...c, needsReview: true })
+        continue
+      }
+      const roi = document.createElement('canvas')
+      roi.width = rw
+      roi.height = rh
+      const rctx = roi.getContext('2d')!
+      rctx.fillStyle = 'white'
+      rctx.fillRect(0, 0, rw, rh)
+      rctx.drawImage(canvas, rx, ry, rw, rh, 0, 0, rw, rh)
+      const { text, conf } = await recognizeTextFromRoi(roi)
+      if (text && conf >= 70) {
+        updated.push({ ...c, detectedText: text, name: text, ocrConf: conf, needsReview: false })
+      } else {
+        updated.push({ ...c, detectedText: text ?? undefined, ocrConf: conf, needsReview: true })
+      }
+    }
+    setCrops(updated)
+  }
   const [isProcessing, setIsProcessing] = useState(false)
   const [selectedPreset, setSelectedPreset] = useState<string>('line-art')
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -1483,9 +1549,36 @@ function App() {
   }
 
   const downloadAll = () => {
+    const nameCounts: Record<string, number> = {}
+    const padded = (n: number) => String(n).padStart(4, '0')
     crops.forEach((crop, index) => {
-      setTimeout(() => downloadCrop(crop), index * 100)
+      const base = crop.name
+      nameCounts[base] = (nameCounts[base] || 0) + 1
+      const suffix = nameCounts[base] > 1 ? `-${nameCounts[base]}` : ''
+      const finalName = `${padded(index + 1)}-${base}${suffix}`
+      const url = URL.createObjectURL(crop.blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${finalName}.png`
+      setTimeout(() => { a.click(); URL.revokeObjectURL(url) }, index * 100)
     })
+    // Also download manifest.json
+    const manifest = crops.map((c, idx) => ({
+      id: c.id,
+      name: c.name,
+      detectedText: c.detectedText ?? null,
+      confidence: c.ocrConf ?? null,
+      needsReview: !!c.needsReview,
+      polygon: c.polygon ?? null,
+      bbox: c.bounds,
+      order: idx + 1
+    }))
+    const blob = new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'manifest.json'
+    setTimeout(() => { a.click(); URL.revokeObjectURL(url) }, crops.length * 120)
   }
 
   return (
@@ -1520,6 +1613,16 @@ function App() {
             className="px-3 py-1 rounded bg-blue-700 hover:bg-blue-500"
           >
             Download All ({crops.length})
+          </button>
+        )}
+        {crops.length > 0 && (
+          <button
+            onClick={async () => {
+              await detectAndNameAll()
+            }}
+            className="px-3 py-1 rounded bg-purple-700 hover:bg-purple-600"
+          >
+            Detect text & name
           </button>
         )}
         
@@ -1871,8 +1974,37 @@ function App() {
                   alt={crop.name}
                   className="w-full h-24 object-cover rounded mb-2"
                 />
-                <div className="flex items-center justify-between">
-                  <span className="text-xs">{crop.name}</span>
+                <div className="flex items-center justify-between gap-2">
+                  {renamingId === crop.id ? (
+                    <input
+                      autoFocus
+                      value={renameInput}
+                      onChange={(e) => setRenameInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          const next = renameInput.trim()
+                          const ok = /^[-0-9]+$/.test(next)
+                          if (ok) {
+                            setCrops(crops.map(c => c.id === crop.id ? { ...c, name: next, needsReview: false } : c))
+                            setRenamingId(null)
+                          }
+                        } else if (e.key === 'Escape') {
+                          setRenamingId(null)
+                        }
+                      }}
+                      className="text-xs bg-neutral-700 border border-neutral-600 rounded px-1 py-0.5 w-24"
+                    />
+                  ) : (
+                    <button
+                      onDoubleClick={() => { setRenamingId(crop.id); setRenameInput(crop.name) }}
+                      title={crop.needsReview ? 'Needs review' : 'Double-click to rename'}
+                      className={`text-xs text-left truncate ${crop.needsReview ? 'text-amber-300' : ''}`}
+                      style={{ maxWidth: '7rem' }}
+                    >
+                      {crop.name}
+                      {crop.needsReview && <span className="ml-1">⚠︎</span>}
+                    </button>
+                  )}
                   <button
                     onClick={() => downloadCrop(crop)}
                     className="px-2 py-1 bg-blue-600 hover:bg-blue-500 rounded text-xs"
