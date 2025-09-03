@@ -449,7 +449,7 @@ function fillHolesBinary(src: Uint8Array, w: number, h: number): Uint8Array {
       if (src[idx] === 0 && outside[idx] === 0) { outside[idx] = 1; stack.push([nx, ny]) }
     }
   }
-  const filled = src.slice()
+  const filled = new Uint8Array(src) // ensure ArrayBuffer type stays Uint8Array<ArrayBuffer>
   for (let i = 0; i < filled.length; i++) {
     if (src[i] === 0 && outside[i] === 0) filled[i] = 1
   }
@@ -500,18 +500,18 @@ function buildSilhouetteMask(
     }
   }
   const th = otsuThreshold(gray)
-  let bin: Uint8Array<ArrayBufferLike> = new Uint8Array(w * h)
+  let bin: any = new Uint8Array(w * h)
   for (let i = 0; i < gray.length; i++) bin[i] = gray[i] < th ? 1 : 0
 
   // morphological close (dilate then erode) to connect broken strokes
   const closeIters = Math.max(0, params.morphClose || 0)
   for (let k = 0; k < closeIters; k++) {
-    bin = dilateBinary(bin, w, h, 1)
-    bin = erodeBinary(bin, w, h, 1)
+    bin = dilateBinary(bin, w, h, 1) as unknown as Uint8Array
+    bin = erodeBinary(bin, w, h, 1) as unknown as Uint8Array
   }
   // additional dilation to merge nearby strokes
   const dilIters = Math.max(0, params.morphDilate || 0)
-  for (let k = 0; k < dilIters; k++) bin = dilateBinary(bin, w, h, 2)
+  for (let k = 0; k < dilIters; k++) bin = dilateBinary(bin, w, h, 2) as unknown as Uint8Array
 
   return bin
 }
@@ -664,7 +664,7 @@ async function detectPolygonsSilhouette(
     const rw = x1 - x0
     const rh = y1 - y0
     // per-item mask in safe ROI
-    let item: Uint8Array<ArrayBufferLike> = new Uint8Array(rw * rh)
+    let item: any = new Uint8Array(rw * rh)
     for (const [px, py] of c.pixels) {
       const rx = px - x0
       const ry = py - y0
@@ -724,14 +724,17 @@ async function detectPolygonsSilhouette(
     const x1 = Math.min(width, x + w + margin)
     const y1 = Math.min(height, y + h + margin)
     const rw = x1 - x0, rh = y1 - y0
-    let item = new Uint8Array(rw * rh)
+    let item: any = new Uint8Array(rw * rh)
     for (const [px, py] of c.pixels) {
       const rx = px - x0, ry = py - y0
       if (rx >= 0 && ry >= 0 && rx < rw && ry < rh) item[ry * rw + rx] = 1
     }
-    item = fillHolesBinary(item, rw, rh)
-    item = morphCloseDisk(item, rw, rh, 2)
-    item = dilateBinaryDisk(item, rw, rh, pad)
+    item = fillHolesBinary(item, rw, rh) as unknown as Uint8Array
+    item = morphCloseDisk(item, rw, rh, 2) as unknown as Uint8Array
+    item = dilateBinaryDisk(item, rw, rh, pad) as unknown as Uint8Array
+    item = fillHolesBinary(item, rw, rh) as unknown as Uint8Array
+    item = morphCloseDisk(item, rw, rh, 2) as unknown as Uint8Array
+    item = dilateBinaryDisk(item, rw, rh, pad) as unknown as Uint8Array
     const b2 = boundaryFromMask(item, rw, rh)
     const polyLocal = traceExternalContour(b2, rw, rh)
     if (polyLocal.length < 3) continue
