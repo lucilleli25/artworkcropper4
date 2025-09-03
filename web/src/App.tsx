@@ -1,7 +1,11 @@
 import { useState, useRef, useEffect } from 'react'
 import './index.css'
 import { LabelWithHelp } from './components/ui/LabelWithHelp'
-import Tesseract from 'tesseract.js'
+// OCR runs in a Web Worker; no Tesseract on main thread
+
+// Performance guards
+const MAX_DETECT_SIDE = 2200; // px; downscale for silhouette detection
+const MAX_MASK_SIDE = 1800;   // px; downscale for gray-plate mask during OCR naming
 
 // Image preprocessing function
 function preprocessImage(ctx: CanvasRenderingContext2D, width: number, height: number, params: EdgeParams): Uint8ClampedArray {
@@ -616,6 +620,7 @@ function buildSilhouetteMask(
   params: EdgeParams,
   _useGraySuppress = false
 ): Uint8Array {
+  void params
   // A) Strict dark-ink silhouette (intensity-only)
   const gray = new Uint8Array(w * h)
   for (let y = 0; y < h; y++) {
@@ -778,6 +783,87 @@ function buildGrayPlateMaskChannels(
   return { mask: m, S, L }
 }
 
+// --- Gray plate detection (global) ------------------------------
+
+type BBox = { x: number; y: number; w: number; h: number }
+
+function detectGrayPlatesGlobal(
+  rgba: Uint8ClampedArray,
+  w: number,
+  h: number
+): BBox[] {
+  const { mask, S, L } = buildGrayPlateMaskChannels(rgba, w, h)
+
+  // Light smoothing to merge the rounded rectangle
+  let m: any = morphCloseDisk(mask, w, h, 3)
+  m = dilateBinaryDisk(m, w, h, 1)
+
+  const comps = labelComponentsBinary(m, w, h)
+  const total = w * h
+  const out: BBox[] = []
+
+  for (const c of comps) {
+    const b = c.bounds
+    const area = b.w * b.h
+    const areaPct = area / total
+    const ar = b.w / Math.max(1, b.h)
+    const fill = c.area / Math.max(1, area)
+
+    // Size & shape gates for number plates (relaxed)
+    if (areaPct < 0.00005 || areaPct > 0.04) continue
+    if (ar < 1.1 || ar > 9.0) continue
+    if (fill < 0.28) continue
+
+    // Color sanity: low saturation, mid lightness inside bbox
+    let sumS = 0, sumL = 0
+    for (let yy = b.y; yy < b.y + b.h; yy++) {
+      for (let xx = b.x; xx < b.x + b.w; xx++) {
+        const gi = yy * w + xx
+        sumS += S[gi]; sumL += L[gi]
+      }
+    }
+    const meanS = sumS / area
+    const meanL = sumL / area
+    if (meanS > 70 || meanL < 95 || meanL > 250) continue
+
+    out.push(b)
+  }
+
+  return out
+}
+
+function bboxCenterDistance(a: BBox, b: BBox): number {
+  const ax = a.x + a.w / 2, ay = a.y + a.h / 2
+  const bx = b.x + b.w / 2, by = b.y + b.h / 2
+  return Math.hypot(ax - bx, ay - by)
+}
+
+function assignPlatesToCrops(
+  plates: BBox[],
+  crops: Array<{ id: string; bounds: BBox; polygon?: [number, number][] }>
+): Record<string, BBox | null> {
+  const map: Record<string, BBox | null> = {}
+  for (const c of crops) {
+    const a = c.bounds
+    let best: BBox | null = null
+    let bestD = Infinity
+
+    // Max allowable distance: proportional to tattoo size, capped
+    const maxD = Math.min(Math.max(a.w, a.h) * 1.2, 260)
+
+    for (const p of plates) {
+      // Prefer plates that lie mostly *outside* the tattoo bbox
+      const overlap = bboxIoU(a, p) // reuse helper
+      if (overlap > 0.05) continue
+
+      const d = bboxCenterDistance(a, p)
+      if (d < bestD && d <= maxD) { bestD = d; best = p }
+    }
+    map[c.id] = best
+  }
+  return map
+}
+
 function polygonCentroid(poly: [number, number][]): { x: number; y: number } {
   let signedArea = 0
   let cx = 0, cy = 0
@@ -860,39 +946,49 @@ async function detectPolygonsSilhouette(
   const mask = buildSilhouetteMask(rgba, width, height, params, false)
   let comps = labelComponentsBinary(mask, width, height)
 
-  // B) Cheap post-filter to drop gray plates using strict T_DARK
-  const gray = new Uint8Array(width * height)
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = (y * width + x) * 4
-      const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2]
-      gray[y * width + x] = Math.round((r + g + b) / 3)
-    }
-  }
-  const otsu = otsuThreshold(gray)
-  const T_DARK = Math.min(255, otsu + 12)
+  // --- NEW: robust gray-plate suppression (color-based occupancy) ---
+  const { mask: grayPlateMask } = buildGrayPlateMaskChannels(rgba, width, height)
+
+  let droppedByGray = 0
   const filtered: typeof comps = []
+
   for (const c of comps) {
     const r = c.bounds
-    let darkCount = 0
+
+    // 1) How much of this bbox is "gray-plate"?
+    let grayCount = 0
     for (let yy = r.y; yy < r.y + r.h; yy++) {
+      let base = yy * width
       for (let xx = r.x; xx < r.x + r.w; xx++) {
-        const gi = yy * width + xx
-        if (gray[gi] < T_DARK) darkCount++
+        if (grayPlateMask[base + xx] === 1) grayCount++
+      }
+    }
+    const grayOcc = grayCount / (r.w * r.h) // [0..1]
+
+    // Main decision: anything dominated by gray is a label plate → drop
+    // Tune 0.32 → 0.25 if plates still slip through; 0.40 if you get false drops.
+    if (grayOcc > 0.32) { droppedByGray++; continue }
+
+    // 2) Fallback: cheap intensity guard (kept but relaxed)
+    //    Helps reject pale, almost empty blobs that are not caught by gray mask.
+    let darkCount = 0, sum = 0
+    for (let yy = r.y; yy < r.y + r.h; yy++) {
+      let base = yy * width * 4
+      for (let xx = r.x; xx < r.x + r.w; xx++) {
+        const i = base + xx * 4
+        const g = (rgba[i] + rgba[i + 1] + rgba[i + 2]) / 3
+        if (g < 200) darkCount++               // "darkish" pixel
+        sum += g
       }
     }
     const inkRatio = darkCount / (r.w * r.h)
-    // mean brightness
-    let sum = 0
-    for (let yy = r.y; yy < r.y + r.h; yy++) {
-      for (let xx = r.x; xx < r.x + r.w; xx++) {
-        sum += gray[yy * width + xx]
-      }
-    }
     const meanL = sum / (r.w * r.h)
-    const pass = !(inkRatio < 0.10 && meanL > 170)
-    if (pass) filtered.push(c)
+    // Drop faint, bright patches that are likely background noise
+    if (inkRatio < 0.06 && meanL > 190) continue
+
+    filtered.push(c)
   }
+
   comps = filtered
 
   const totalPx = width * height
@@ -1011,7 +1107,7 @@ async function detectPolygonsSilhouette(
     }
   }
 
-  console.table({ totalComponents: comps.length, kept: polygons.length, droppedByArea, droppedByAspect, droppedByBorder })
+  console.table({ totalComponents: comps.length, kept: polygons.length, droppedByArea, droppedByAspect, droppedByBorder, droppedByGray })
   return { polygons, mask: { data: mask, width, height } }
 }
 
@@ -1321,31 +1417,85 @@ function App() {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameInput, setRenameInput] = useState<string>('')
   
-  async function recognizeTextFromRoi(roiCanvas: HTMLCanvasElement): Promise<{ text: string | null; conf: number }> {
+  // ---------- OCR Worker Queue (non-blocking) ----------
+  const ocrWorkerRef = useRef<Worker | null>(null)
+  const ocrQueueRef = useRef<Array<{ id: string; bitmap: ImageBitmap }>>([])
+  const ocrBusyRef = useRef(false)
+  const ocrInFlightRef = useRef(0)
+  const ocrCanceledRef = useRef(false)
+  const [ocrInProgress, setOcrInProgress] = useState(false)
+  const [ocrDone, setOcrDone] = useState(0)
+  const [ocrTotal, setOcrTotal] = useState(0)
+
+  function scheduleIdle(fn: () => void) {
+    // @ts-ignore
+    const ric = window.requestIdleCallback as any
+    if (typeof ric === 'function') ric(fn)
+    else setTimeout(fn, 0)
+  }
+
+  function ensureOcrWorker() {
+    if (!ocrWorkerRef.current) {
+      ocrWorkerRef.current = new Worker(new URL('./workers/ocrWorker.ts', import.meta.url), { type: 'module' })
+      ocrWorkerRef.current.onmessage = (e: MessageEvent) => {
+        const { type, id, text, confidence } = e.data || {}
+        if (type === 'ocr-result') {
+          const ok = /^\d{3,4}-\d{2}$/.test(String(text || '').trim()) && (confidence || 0) >= 70
+          setCrops(prev => prev.map(c => c.id === id ? { ...c, detectedText: text || undefined, name: ok ? String(text) : c.name, ocrConf: confidence, needsReview: !ok } : c))
+          setOcrDone(prev => prev + 1)
+          ocrInFlightRef.current = Math.max(0, ocrInFlightRef.current - 1)
+          if (ocrInFlightRef.current === 0) {
+            ocrBusyRef.current = false
+            scheduleIdle(pumpOcr)
+          }
+        }
+      }
+    }
+  }
+
+  function enqueueOCR(job: { id: string; bitmap: ImageBitmap }) {
+    ocrQueueRef.current.push(job)
+    scheduleIdle(pumpOcr)
+  }
+
+  function pumpOcr() {
+    if (ocrCanceledRef.current) return
+    if (ocrBusyRef.current) return
+    const q = ocrQueueRef.current
+    if (q.length === 0) {
+      if (ocrInProgress) setOcrInProgress(false)
+      return
+    }
+    ensureOcrWorker()
+    const worker = ocrWorkerRef.current!
+    const batch = q.splice(0, 4)
+    ocrInFlightRef.current = batch.length
+    ocrBusyRef.current = true
+    const transferables: Transferable[] = batch.map(b => b.bitmap as unknown as Transferable)
+    worker.postMessage({ jobs: batch }, transferables)
+  }
+
+  function cancelOcr() {
+    ocrCanceledRef.current = true
+    ocrQueueRef.current = []
+    // let in-flight finish; UI will stop pumping
+    setOcrInProgress(false)
+  }
+
+  async function createBitmapForOCR(srcCanvas: HTMLCanvasElement, rx: number, ry: number, rw: number, rh: number): Promise<ImageBitmap> {
     const scale = 2
-    const off = document.createElement('canvas')
-    off.width = roiCanvas.width * scale
-    off.height = roiCanvas.height * scale
+    const off = new OffscreenCanvas(rw * scale, rh * scale)
     const octx = off.getContext('2d')!
     octx.fillStyle = 'white'
     octx.fillRect(0, 0, off.width, off.height)
-    octx.imageSmoothingEnabled = false
-    octx.drawImage(roiCanvas, 0, 0, off.width, off.height)
-    const res7 = await Tesseract.recognize(off, 'eng', { logger: () => {} })
-    let raw = (res7.data.text || '').trim()
-    let conf = res7.data.confidence || 0
-    if (!raw) {
-      const res6 = await Tesseract.recognize(off, 'eng', { logger: () => {} })
-      raw = (res6.data.text || '').trim()
-      conf = Math.max(conf, res6.data.confidence || 0)
-    }
-    // whitelist post-filter
-    raw = raw.replace(/[^0-9-]/g, '')
-    const ok = /^([0-9]{3,})(-[0-9]{2})?$/.test(raw)
-    return { text: ok ? raw : null, conf }
+    ;(octx as any).imageSmoothingEnabled = false
+    octx.drawImage(srcCanvas, rx, ry, rw, rh, 0, 0, off.width, off.height)
+    return await createImageBitmap(off)
   }
 
   async function detectAndNameAll() {
+    // Let the UI paint before heavy work
+    await new Promise(requestAnimationFrame)
     if (!canvasRef.current || crops.length === 0) return
     const canvas = canvasRef.current
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!
@@ -1354,74 +1504,63 @@ function App() {
     canvas.width = img.naturalWidth
     canvas.height = img.naturalHeight
     ctx.drawImage(img, 0, 0)
-    const sheet = ctx.getImageData(0, 0, canvas.width, canvas.height)
-    const grayChannels = buildGrayPlateMaskChannels(sheet.data, canvas.width, canvas.height)
-    const RINGS = [24, 40, 64, 96, 128]
-    const THICK = 18
+    // Downscale once for global plate detection
+    const maskScale = Math.min(1, MAX_MASK_SIDE / Math.max(canvas.width, canvas.height))
+    const maskW = Math.max(1, Math.round(canvas.width * maskScale))
+    const maskH = Math.max(1, Math.round(canvas.height * maskScale))
+    const mCanvas = new OffscreenCanvas(maskW, maskH)
+    const mCtx = mCanvas.getContext('2d')!
+    mCtx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, maskW, maskH)
+    const maskImage = mCtx.getImageData(0, 0, maskW, maskH)
+
+    // 1) Find all plates globally (fast)
+    const platesSmall = detectGrayPlatesGlobal(maskImage.data, maskW, maskH)
+    const inv = 1 / (maskScale || 1)
+    const plates: BBox[] = platesSmall.map(b => ({
+      x: Math.floor(b.x * inv),
+      y: Math.floor(b.y * inv),
+      w: Math.ceil(b.w * inv),
+      h: Math.ceil(b.h * inv),
+    }))
+
+    // 2) Assign nearest plate to each crop
+    const assignment = assignPlatesToCrops(plates, crops)
+
     const updated: typeof crops = []
-    for (const c of crops) {
-      if (!c.polygon) { updated.push(c); continue }
-      let best: { x: number; y: number; w: number; h: number } | null = null
-      let bestScore = -1
-      const cent = polygonCentroid(c.polygon)
-      for (const r of RINGS) {
-        const ring = makeRingMaskForPolygon(c.polygon, r, THICK, canvas.width, canvas.height)
-        // intersect with GRAY mask
-        const comps: Array<{ x: number; y: number; w: number; h: number; area: number; meanS: number; meanL: number; solidity: number }>=[]
-        // simple connected components in local ROI using intersection
-        const inter = new Uint8Array(ring.w * ring.h)
-        for (let yy = 0; yy < ring.h; yy++) {
-          for (let xx = 0; xx < ring.w; xx++) {
-            const gi = (ring.y0 + yy) * canvas.width + (ring.x0 + xx)
-            inter[yy * ring.w + xx] = ring.mask[yy * ring.w + xx] & grayChannels.mask[gi]
-          }
-        }
-        const localComps = labelComponentsBinary(inter, ring.w, ring.h)
-        for (const cc of localComps) {
-          const bx = ring.x0 + cc.bounds.x, by = ring.y0 + cc.bounds.y
-          const bw = cc.bounds.w, bh = cc.bounds.h
-          const areaPct = (bw * bh) / (canvas.width * canvas.height)
-          const ar = bw / Math.max(1, bh)
-          if (!(areaPct >= 0.0002 && areaPct <= 0.008)) continue
-          if (!(ar >= 1.5 && ar <= 6.5)) continue
-          // solidity proxy via boundary/perimeter
-          const boundary = boundaryFromMask((() => { const m = new Uint8Array(bw * bh); for (const [px, py] of cc.pixels) { const lx = px - cc.bounds.x; const ly = py - cc.bounds.y; m[ly * bw + lx] = 1 } return m })(), bw, bh)
-          let per = 0; for (let i = 0; i < boundary.length; i++) if (boundary[i]) per++
-          const solidity = Math.min(1, cc.area / Math.max(1, per))
-          if (solidity < 0.85) continue
-          // mean S and L in bbox
-          let sumS = 0, sumL = 0
-          for (let yy = 0; yy < bh; yy++) {
-            for (let xx = 0; xx < bw; xx++) {
-              const gi = (by + yy) * canvas.width + (bx + xx)
-              sumS += grayChannels.S[gi]
-              sumL += grayChannels.L[gi]
-            }
-          }
-          const meanS = sumS / (bw * bh)
-          const meanL = sumL / (bw * bh)
-          const d = Math.hypot(bx + bw / 2 - cent.x, by + bh / 2 - cent.y)
-          const score = 2000 / (d + 1) + (255 - meanS) + 0.4 * meanL
-          if (score > bestScore) { bestScore = score; best = { x: bx, y: by, w: bw, h: bh } }
-        }
-      }
-      if (best) {
+    const jobs: Array<{ id: string; bitmap: ImageBitmap }> = []
+
+    // 3) Create OCR bitmaps for assigned plates
+    for (let i = 0; i < crops.length; i++) {
+      const c = crops[i]
+      const p = assignment[c.id]
+      if (i % 6 === 0) await new Promise(requestAnimationFrame)
+
+      if (p) {
         const pad = 8
-        const rx = Math.max(0, best.x - pad)
-        const ry = Math.max(0, best.y - pad)
-        const rw = Math.min(canvas.width - rx, best.w + pad * 2)
-        const rh = Math.min(canvas.height - ry, best.h + pad * 2)
-        const roi = document.createElement('canvas')
-        roi.width = rw; roi.height = rh
-        roi.getContext('2d')!.drawImage(canvas, rx, ry, rw, rh, 0, 0, rw, rh)
-        const { text, conf } = await recognizeTextFromRoi(roi)
-        if (text && conf >= 70) updated.push({ ...c, detectedText: text, name: text, ocrConf: conf, needsReview: false })
-        else updated.push({ ...c, detectedText: text ?? undefined, ocrConf: conf, needsReview: true })
+        const rx = Math.max(0, p.x - pad)
+        const ry = Math.max(0, p.y - pad)
+        const rw = Math.min(canvas.width - rx, p.w + pad * 2)
+        const rh = Math.min(canvas.height - ry, p.h + pad * 2)
+        const bitmap = await createBitmapForOCR(canvas, rx, ry, rw, rh)
+        jobs.push({ id: c.id, bitmap })
+        updated.push(c) // name filled by OCR callback
       } else {
         updated.push({ ...c, needsReview: true })
       }
     }
-    setCrops(updated)
+
+    // 4) Kick OCR worker in batches; keep UI responsive
+    if (jobs.length > 0) {
+      ocrCanceledRef.current = false
+      setOcrDone(0)
+      setOcrTotal(jobs.length)
+      setOcrInProgress(true)
+      ensureOcrWorker()
+      setCrops(updated)                    // reflect “will name” state in UI
+      for (const j of jobs) enqueueOCR(j)  // worker pipeline handles updating names
+    } else {
+      setCrops(updated)
+    }
   }
   const [isProcessing, setIsProcessing] = useState(false)
   const [selectedPreset, setSelectedPreset] = useState<string>('line-art')
@@ -1593,11 +1732,42 @@ function App() {
         canvas.height = img.height
         ctx.drawImage(img, 0, 0)
         
-        // If silhouette-friendly preset, run the silhouette pipeline on full image
+        // If silhouette-friendly preset, run the silhouette pipeline on a **downscaled** copy
+        // to keep the main thread responsive, then scale polygons back to original for cropping.
         if (selectedPreset === 'line-art' || selectedPreset === 'detailed-art') {
           try {
-            const { polygons: polys } = await detectPolygonsSilhouette(canvas, ctx, params)
-            const filtered = suppressInnerIslands(polys, 0.98)
+            // Draw original for final cropping/display
+            canvas.width = img.width
+            canvas.height = img.height
+            ctx.drawImage(img, 0, 0)
+
+            // Downscale for detection
+            const scaleDet = Math.min(1, MAX_DETECT_SIDE / Math.max(img.width, img.height))
+            const detCanvas = document.createElement('canvas')
+            detCanvas.width = Math.max(1, Math.round(img.width * scaleDet))
+            detCanvas.height = Math.max(1, Math.round(img.height * scaleDet))
+            const detCtx = detCanvas.getContext('2d', { willReadFrequently: true })!
+            detCtx.drawImage(img, 0, 0, detCanvas.width, detCanvas.height)
+
+            // Yield one frame so UI paints "Processing..."
+            await new Promise(requestAnimationFrame)
+
+            const { polygons: polys } = await detectPolygonsSilhouette(detCanvas as HTMLCanvasElement, detCtx as any, params)
+
+            // Scale polygons back up to original coordinates
+            const inv = 1 / (scaleDet || 1)
+            const scaled = polys.map(p => ({
+              id: p.id,
+              polygon: p.polygon.map(([px, py]) => [px * inv, py * inv] as [number, number]),
+              bounds: {
+                x: Math.floor(p.bounds.x * inv),
+                y: Math.floor(p.bounds.y * inv),
+                w: Math.ceil(p.bounds.w * inv),
+                h: Math.ceil(p.bounds.h * inv)
+              }
+            }))
+
+            const filtered = suppressInnerIslands(scaled, 0.98)
             const polygonCrops = await cropsFromPolygons(canvas, filtered)
             setCrops(polygonCrops)
           } finally {
@@ -1762,6 +1932,17 @@ function App() {
           >
             Detect text & name
           </button>
+        )}
+        {ocrInProgress && (
+          <div className="flex items-center gap-2 ml-2">
+            <span className="text-xs text-neutral-400">Naming {ocrDone}/{ocrTotal}…</span>
+            <button
+              onClick={cancelOcr}
+              className="px-2 py-1 rounded bg-rose-700 hover:bg-rose-600 text-xs"
+            >
+              Cancel
+            </button>
+          </div>
         )}
         
         <div className="text-sm text-neutral-400">
@@ -2151,7 +2332,6 @@ function App() {
                   </button>
                   <button
                     onClick={async () => {
-                      // retry with wider ring radii
                       if (!canvasRef.current || !imgRef.current || !crop.polygon) return
                       const canvas = canvasRef.current
                       const ctx = canvas.getContext('2d', { willReadFrequently: true })!
@@ -2207,14 +2387,12 @@ function App() {
                         const ry = Math.max(0, best.y - pad)
                         const rw = Math.min(canvas.width - rx, best.w + pad * 2)
                         const rh = Math.min(canvas.height - ry, best.h + pad * 2)
-                        const roi = document.createElement('canvas')
-                        roi.width = rw; roi.height = rh
-                        roi.getContext('2d')!.drawImage(canvas, rx, ry, rw, rh, 0, 0, rw, rh)
-                        const { text, conf } = await recognizeTextFromRoi(roi)
-                        if (text && conf >= 70) setCrops(crops.map(c => c.id === crop.id ? { ...c, detectedText: text, name: text, ocrConf: conf, needsReview: false } : c))
-                        else setCrops(crops.map(c => c.id === crop.id ? { ...c, detectedText: text ?? undefined, ocrConf: conf, needsReview: true } : c))
+                        const bitmap = await createBitmapForOCR(canvas, rx, ry, rw, rh)
+                        ocrCanceledRef.current = false
+                        setOcrDone(0); setOcrTotal(1); setOcrInProgress(true)
+                        enqueueOCR({ id: crop.id, bitmap })
                       } else {
-                        setCrops(crops.map(c => c.id === crop.id ? { ...c, needsReview: true } : c))
+                        setCrops(prev => prev.map(c => c.id === crop.id ? { ...c, needsReview: true } : c))
                       }
                     }}
                     className="px-2 py-1 bg-purple-700 hover:bg-purple-600 rounded text-xs"
