@@ -379,12 +379,133 @@ function erodeBinaryDisk(src: Uint8Array, w: number, h: number, radius: number):
   return dst
 }
 
-function morphOpenDisk(src: Uint8Array, w: number, h: number, radius: number): Uint8Array {
+function morphOpenDisk(src: any, w: number, h: number, radius: number): Uint8Array {
   return dilateBinaryDisk(erodeBinaryDisk(src, w, h, radius), w, h, radius)
 }
 
-function morphCloseDisk(src: Uint8Array, w: number, h: number, radius: number): Uint8Array {
+function morphCloseDisk(src: any, w: number, h: number, radius: number): Uint8Array {
   return erodeBinaryDisk(dilateBinaryDisk(src, w, h, radius), w, h, radius)
+}
+
+// RGB helpers: sRGB -> HSV and CIE Lab (approx)
+function rgbToHsv(r: number, g: number, b: number): { h: number; s: number; v: number } {
+  const rn = r / 255, gn = g / 255, bn = b / 255
+  const max = Math.max(rn, gn, bn), min = Math.min(rn, gn, bn)
+  const d = max - min
+  let h = 0
+  if (d !== 0) {
+    switch (max) {
+      case rn: h = ((gn - bn) / d + (gn < bn ? 6 : 0)); break
+      case gn: h = (bn - rn) / d + 2; break
+      default: h = (rn - gn) / d + 4
+    }
+    h /= 6
+  }
+  const s = max === 0 ? 0 : d / max
+  const v = max
+  return { h: h * 179, s: s * 255, v: v * 255 }
+}
+
+function srgbToLinear(c: number): number {
+  const x = c / 255
+  return x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4)
+}
+
+function rgbToLab(r: number, g: number, b: number): { L: number; a: number; b: number } {
+  // sRGB D65 → XYZ
+  const R = srgbToLinear(r), G = srgbToLinear(g), B = srgbToLinear(b)
+  let X = R * 0.4124564 + G * 0.3575761 + B * 0.1804375
+  let Y = R * 0.2126729 + G * 0.7151522 + B * 0.0721750
+  let Z = R * 0.0193339 + G * 0.1191920 + B * 0.9503041
+  // Normalize by D65 white
+  X /= 0.95047; Y /= 1.00000; Z /= 1.08883
+  const f = (t: number) => t > 0.008856 ? Math.cbrt(t) : (7.787 * t + 16 / 116)
+  const fx = f(X), fy = f(Y), fz = f(Z)
+  const L = (116 * fy - 16) * (255 / 100) // scale L to [0..255]
+  const a = (500 * (fx - fy)) * 1 + 128     // center around ~128
+  const bb = (200 * (fy - fz)) * 1 + 128
+  return { L: Math.max(0, Math.min(255, L)), a: Math.max(0, Math.min(255, a)), b: Math.max(0, Math.min(255, bb)) }
+}
+
+// K-means over features [L,a,b,S,V] on a downsampled grid
+function kmeans(features: number[][], K: number, iters = 8): { centers: number[][]; labels: number[] } {
+  const N = features.length
+  const D = features[0].length
+  // init centers by random picks
+  const centers: number[][] = []
+  const used = new Set<number>()
+  while (centers.length < K) {
+    const idx = Math.floor(Math.random() * N)
+    if (!used.has(idx)) { centers.push(features[idx].slice()); used.add(idx) }
+  }
+  const labels = new Array<number>(N).fill(0)
+  for (let iter = 0; iter < iters; iter++) {
+    // assign
+    for (let i = 0; i < N; i++) {
+      let best = 0, bestDist = Infinity
+      const xi = features[i]
+      for (let k = 0; k < K; k++) {
+        let d = 0
+        const ck = centers[k]
+        for (let dIdx = 0; dIdx < D; dIdx++) { const t = xi[dIdx] - ck[dIdx]; d += t * t }
+        if (d < bestDist) { bestDist = d; best = k }
+      }
+      labels[i] = best
+    }
+    // update
+    const sums: number[][] = Array.from({ length: K }, () => Array(D).fill(0))
+    const counts = new Array<number>(K).fill(0)
+    for (let i = 0; i < N; i++) {
+      const k = labels[i]
+      counts[k]++
+      const xi = features[i]
+      for (let dIdx = 0; dIdx < D; dIdx++) sums[k][dIdx] += xi[dIdx]
+    }
+    for (let k = 0; k < K; k++) {
+      if (counts[k] === 0) continue
+      for (let dIdx = 0; dIdx < D; dIdx++) centers[k][dIdx] = sums[k][dIdx] / counts[k]
+    }
+  }
+  return { centers, labels }
+}
+
+// Compute adaptive gray center using downsampled k-means on LAB/HSV
+export function computeAdaptiveGrayCenter(
+  data: Uint8ClampedArray,
+  w: number,
+  h: number,
+  maxSide = 640,
+  K = 4
+): { center: { L: number; a: number; b: number; S: number; V: number }; frac: number } {
+  const scale = Math.min(1, maxSide / Math.max(w, h))
+  const sw = Math.max(1, Math.round(w * scale))
+  const sh = Math.max(1, Math.round(h * scale))
+  const features: number[][] = []
+  const sampleEvery = Math.max(1, Math.floor(1 / scale)) // simple stride sampling from full-res
+  for (let y = 0; y < h; y += sampleEvery) {
+    for (let x = 0; x < w; x += sampleEvery) {
+      const i = (y * w + x) * 4
+      const r = data[i], g = data[i + 1], b = data[i + 2]
+      const { h: _h, s, v } = rgbToHsv(r, g, b)
+      const { L, a, b: bb } = rgbToLab(r, g, b)
+      features.push([L, a, bb, s, v])
+      if (features.length > sw * sh) break
+    }
+    if (features.length > sw * sh) break
+  }
+  const { centers, labels } = kmeans(features, K, 6)
+  let best = -1, bestScore = -1, counts = new Array<number>(K).fill(0)
+  for (const k of labels) counts[k]++
+  for (let k = 0; k < K; k++) {
+    const [Lc, ac, bc, Sc, Vc] = centers[k]
+    const neutralA = Math.abs(ac - 128)
+    const neutralB = Math.abs(bc - 128)
+    const score = (255 - Sc) + 0.7 * Lc + 0.5 * Vc + (20 - Math.min(20, neutralA)) + (20 - Math.min(20, neutralB))
+    if (score > bestScore) { bestScore = score; best = k }
+  }
+  const frac = counts[best] / labels.length
+  const [Lc, ac, bc, Sc, Vc] = centers[best]
+  return { center: { L: Lc, a: ac, b: bc, S: Sc, V: Vc }, frac }
 }
 
 // Simple Sobel edge magnitude → binary mask (0/1)
@@ -487,9 +608,14 @@ function buildSilhouetteMask(
   data: Uint8ClampedArray,
   w: number,
   h: number,
-  params: EdgeParams
+  params: EdgeParams,
+  useGraySuppress = false
 ): Uint8Array {
   const gray = new Uint8Array(w * h)
+  const hsvS = useGraySuppress ? new Uint8Array(w * h) : null
+  const labL = useGraySuppress ? new Uint8Array(w * h) : null
+  const labA = useGraySuppress ? new Uint8Array(w * h) : null
+  const labB = useGraySuppress ? new Uint8Array(w * h) : null
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4
@@ -497,11 +623,42 @@ function buildSilhouetteMask(
       const g = data[i + 1]
       const b = data[i + 2]
       gray[y * w + x] = Math.round((r + g + b) / 3)
+      if (useGraySuppress && hsvS && labL && labA && labB) {
+        const { s } = rgbToHsv(r, g, b)
+        const lab = rgbToLab(r, g, b)
+        hsvS[y * w + x] = s
+        labL[y * w + x] = lab.L
+        labA[y * w + x] = lab.a
+        labB[y * w + x] = lab.b
+      }
     }
   }
-  const th = otsuThreshold(gray)
+  const otsu = otsuThreshold(gray)
   let bin: any = new Uint8Array(w * h)
-  for (let i = 0; i < gray.length; i++) bin[i] = gray[i] < th ? 1 : 0
+  if (useGraySuppress) {
+    const DARK_BIAS = 12
+    const tDark = Math.max(0, Math.min(255, otsu - DARK_BIAS))
+    for (let i = 0; i < gray.length; i++) bin[i] = gray[i] < tDark ? 1 : 0
+    // HSV + Lab gray detection
+    const S_MAX = 35, Lmin = 150, Lmax = 230, A_MAX = 10, B_MAX = 10
+    let text: any = new Uint8Array(w * h)
+    for (let i = 0; i < gray.length; i++) {
+      const lowSat = (hsvS![i] <= S_MAX) ? 1 : 0
+      const midL = (labL![i] >= Lmin && labL![i] <= Lmax) ? 1 : 0
+      const aOk = Math.abs(labA![i] - 128) <= A_MAX ? 1 : 0
+      const bOk = Math.abs(labB![i] - 128) <= B_MAX ? 1 : 0
+      text[i] = lowSat & midL & aOk & bOk
+    }
+    text = morphCloseDisk(text as Uint8Array, w, h, 1) as unknown as Uint8Array
+    text = dilateBinaryDisk(text as Uint8Array, w, h, 1) as unknown as Uint8Array
+    const notText = new Uint8Array(w * h)
+    for (let i = 0; i < text.length; i++) notText[i] = text[i] ? 0 : 1
+    const combined = new Uint8Array(w * h)
+    for (let i = 0; i < bin.length; i++) combined[i] = bin[i] & notText[i]
+    bin = combined
+  } else {
+    for (let i = 0; i < gray.length; i++) bin[i] = gray[i] < otsu ? 1 : 0
+  }
 
   // morphological close (dilate then erode) to connect broken strokes
   const closeIters = Math.max(0, params.morphClose || 0)
@@ -635,7 +792,8 @@ async function detectPolygonsSilhouette(
 ): Promise<{ polygons: Array<{ id: string; polygon: [number, number][]; bounds: { x: number; y: number; w: number; h: number } }>; mask: { data: Uint8Array; width: number; height: number } }> {
   const { width, height } = canvas
   const rgba = ctx.getImageData(0, 0, width, height).data
-  const mask = buildSilhouetteMask(rgba, width, height, params)
+  // In line-art mode, suppress gray labels from the silhouette
+  const mask = buildSilhouetteMask(rgba, width, height, params, true)
   const comps = labelComponentsBinary(mask, width, height)
 
   const totalPx = width * height
@@ -775,6 +933,59 @@ function bboxIoU(a: { x: number; y: number; w: number; h: number }, b: { x: numb
 
 function polygonIoU(a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }): number {
   return bboxIoU(a, b)
+}
+
+// ---------- Inner-island suppression (no external libs) ----------
+function polygonAreaSigned(poly: [number, number][]): number {
+  let s = 0
+  for (let i = 0; i < poly.length; i++) {
+    const [x1, y1] = poly[i]
+    const [x2, y2] = poly[(i + 1) % poly.length]
+    s += x1 * y2 - x2 * y1
+  }
+  return s / 2
+}
+
+function pointInPolygon(x: number, y: number, poly: [number, number][]): boolean {
+  // Ray casting
+  let inside = false
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i][0], yi = poly[i][1]
+    const xj = poly[j][0], yj = poly[j][1]
+    const intersect = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi + 1e-9) + xi
+    if (intersect) inside = !inside
+  }
+  return inside
+}
+
+function fractionVerticesInside(inner: [number, number][], outer: [number, number][]): number {
+  if (inner.length === 0) return 0
+  let insideCount = 0
+  for (const [x, y] of inner) if (pointInPolygon(x, y, outer)) insideCount++
+  return insideCount / inner.length
+}
+
+function suppressInnerIslands(
+  polygons: Array<{ id: string; polygon: [number, number][]; bounds: { x: number; y: number; w: number; h: number } }>,
+  containmentTol = 0.98
+): Array<{ id: string; polygon: [number, number][]; bounds: { x: number; y: number; w: number; h: number } }> {
+  const withArea = polygons.map(p => ({...p, area: Math.abs(polygonAreaSigned(p.polygon)) }))
+  const sorted = [...withArea].sort((a, b) => b.area - a.area)
+  const keep: typeof withArea = []
+  for (const q of sorted) {
+    let contained = false
+    for (const p of keep) {
+      // fast bbox rejection
+      const qb = polygonToBBox(q.polygon)
+      const pb = polygonToBBox(p.polygon)
+      const bboxInside = qb.x >= pb.x && qb.y >= pb.y && qb.x + qb.w <= pb.x + pb.w && qb.y + qb.h <= pb.y + pb.h
+      if (!bboxInside) continue
+      const frac = fractionVerticesInside(q.polygon, p.polygon)
+      if (frac >= containmentTol) { contained = true; break }
+    }
+    if (!contained) keep.push(q)
+  }
+  return keep.map(({area, ...rest}) => rest)
 }
 
 // Simplify path via radial-distance-like reduction (proxy for Douglas-Peucker for speed)
@@ -1182,7 +1393,8 @@ function App() {
         if (selectedPreset === 'line-art' || selectedPreset === 'detailed-art') {
           try {
             const { polygons: polys } = await detectPolygonsSilhouette(canvas, ctx, params)
-            const polygonCrops = await cropsFromPolygons(canvas, polys)
+            const filtered = suppressInnerIslands(polys, 0.98)
+            const polygonCrops = await cropsFromPolygons(canvas, filtered)
             setCrops(polygonCrops)
           } finally {
             setIsProcessing(false)
